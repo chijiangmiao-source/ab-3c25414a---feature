@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.simulator import (  # noqa: E402
     ARCH_REGS,
+    LineageQueryError,
     Violation,
     parse_events,
     parse_program,
@@ -488,6 +489,167 @@ class IncrementalSimulatorTests(unittest.TestCase):
         s1 = sim.step(evs[1])
         self.assertEqual(s1["violation"]["code"], "COMMIT_UNFINISHED")
         self.assertTrue(sim.finished)
+
+
+class LineageTests(unittest.TestCase):
+    def _sim(self, program, events):
+        sim = Simulator(parse_program(program))
+        evs = parse_events(events)
+        for ev in evs:
+            rec = sim.step(ev)
+            if rec["violation"]:
+                break
+        return sim, evs
+
+    def test_initial_register_root(self):
+        sim, _ = self._sim("ADD R1,R0,R0", "dispatch I0")
+        dag = sim.lineage(0, 0)   # R0 untouched
+        self.assertEqual(dag["root"], "initial:R0")
+        self.assertEqual(len(dag["nodes"]), 1)
+        self.assertEqual(dag["target_tag"], 0)
+        self.assertEqual(dag["target_generation"], 0)
+
+    def test_dag_nodes_edges_and_stable_order(self):
+        sim, _ = self._sim(
+            "ADD R1,R0,R0\nADD R2,R1,R0\nADD R3,R2,R1",
+            "dispatch I0\ndispatch I1\ndispatch I2")
+        dag = sim.lineage(2, 3)
+        ids = [n["id"] for n in dag["nodes"]]
+        # nodes: initial R0, dyn I0, dyn I1, dyn I2
+        self.assertEqual(set(ids), {"initial:R0", "dyn:I0", "dyn:I1", "dyn:I2"})
+        # stable ordering: dynamic nodes in dispatch order, initials last
+        dyn = [n for n in dag["nodes"] if n["kind"] == "dynamic"]
+        self.assertEqual([n["seq"] for n in dyn], [0, 1, 2])
+        # root = I2 and edges match dispatch-time source maps
+        self.assertEqual(dag["root"], "dyn:I2")
+        edge_pairs = {(e["from"], e["to"], e["operand"]) for e in dag["edges"]}
+        self.assertIn(("dyn:I0", "dyn:I1", 0), edge_pairs)
+        self.assertIn(("dyn:I1", "dyn:I2", 0), edge_pairs)
+        self.assertIn(("dyn:I0", "dyn:I2", 1), edge_pairs)
+        self.assertTrue(all(e["captured_at_dispatch_event"] ==
+                            next(n for n in dag["nodes"] if n["id"] == e["to"])
+                            ["dispatch_event_index"] for e in dag["edges"]))
+        # edge ordering: by dispatch event then operand
+        self.assertEqual(
+            [(e["to"], e["operand"]) for e in dag["edges"]],
+            sorted((e["to"], e["operand"]) for e in dag["edges"]))
+
+    def test_tag_reuse_after_mispredict_is_not_confused(self):
+        prog = """
+        ADD R1,R0,R0
+        BEQ R1,R0 predict=taken
+        ADD R2,R1,R0
+        ADD R3,R2,R0
+        ADD R2,R1,R0
+        """
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        dispatch I3
+        writeback I0
+        writeback I1
+        commit I0
+        resolve I1 not-taken
+        dispatch I4
+        """
+        sim, _ = self._sim(prog, events)
+        # At step 2 R2 was produced by the (later squashed) I2 at P9 g1
+        before = sim.lineage(2, 2)
+        self.assertEqual(before["root"], "dyn:I2")
+        self.assertEqual((before["target_tag"], before["target_generation"]), (9, 1))
+        i2 = next(n for n in before["nodes"] if n["id"] == "dyn:I2")
+        self.assertFalse(i2["squashed"])
+        # At step 8 (post-rollback + refetch) R2 is I4 at the SAME tag P9 g2
+        after = sim.lineage(8, 2)
+        self.assertEqual(after["root"], "dyn:I4")
+        self.assertEqual((after["target_tag"], after["target_generation"]), (9, 2))
+        ids = {n["id"] for n in after["nodes"]}
+        self.assertNotIn("dyn:I2", ids)
+        self.assertNotIn("dyn:I3", ids)
+        # the squashed instance still carries its clearance explanation
+        i2_now = sim.instances[(9, 1)].to_dict()
+        self.assertTrue(i2_now["squashed"])
+        self.assertEqual(i2_now["squash"]["reason"], "mispredict")
+        self.assertEqual(i2_now["squash"]["branch_seq"], 1)
+
+    def test_historical_query_before_reuse_keeps_squashed_branch(self):
+        prog = """
+        ADD R1,R0,R0
+        BEQ R1,R0 predict=taken
+        ADD R2,R1,R0
+        ADD R2,R1,R0
+        """
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        writeback I0
+        writeback I1
+        commit I0
+        resolve I1 not-taken
+        dispatch I3
+        """
+        sim, _ = self._sim(prog, events)
+        # historical query at step 2 still resolves R2 to I2 even though the
+        # current map points at I3 (P9 reused, different generation)
+        hist = sim.lineage(2, 2)
+        self.assertEqual(hist["root"], "dyn:I2")
+        self.assertEqual(hist["target_generation"], 1)
+        i2_hist = next(n for n in hist["nodes"] if n["id"] == "dyn:I2")
+        self.assertFalse(i2_hist["squashed"])          # live as of step 2
+        self.assertTrue(i2_hist["eventually_squashed"])  # clearance note retained
+        self.assertIsNotNone(i2_hist["squash"])
+        cur = sim.lineage(7, 2)
+        self.assertEqual(cur["root"], "dyn:I3")
+        self.assertEqual(cur["target_generation"], 2)
+
+    def test_lineage_after_exception_restore_points_to_valid_instance(self):
+        prog = """
+        ADD R1,R0,R0
+        ADD R2,R1,R0
+        MUL R3,R1,R2
+        ADD R4,R3,R1
+        ADD R3,R4,R2
+        """
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        dispatch I3
+        dispatch I4
+        writeback I0
+        commit I0
+        exception I1
+        """
+        sim, _ = self._sim(prog, events)
+        # R3 restored to initial P3; R1 stays the committed I0
+        self.assertEqual(sim.lineage(7, 3)["root"], "initial:R3")
+        self.assertEqual(sim.lineage(7, 4)["root"], "initial:R4")
+        r1 = sim.lineage(7, 1)
+        self.assertEqual(r1["root"], "dyn:I0")
+        self.assertTrue(next(n for n in r1["nodes"]
+                             if n["id"] == "dyn:I0")["committed"])
+        # squashed faulting/younger instances keep clearance notes
+        fault = sim.instance_by_seq[1].to_dict()
+        self.assertTrue(fault["squashed"])
+        self.assertEqual(fault["squash"]["reason"], "exception")
+        self.assertTrue(fault["squash"]["is_faulting"])
+        younger = sim.instance_by_seq[4].to_dict()
+        self.assertTrue(younger["squash"]["reason"] == "exception")
+        self.assertFalse(younger["squash"]["is_faulting"])
+
+    def test_query_validation(self):
+        sim, _ = self._sim("ADD R1,R0,R0", "dispatch I0")
+        with self.assertRaises(LineageQueryError) as cm:
+            sim.lineage(1, 1)  # beyond executed cursor
+        self.assertEqual(cm.exception.code, "LINEAGE_STEP_OUT_OF_RANGE")
+        with self.assertRaises(LineageQueryError):
+            sim.lineage(-1, 1)
+        with self.assertRaises(LineageQueryError):
+            sim.lineage(0, 8)
+        with self.assertRaises(LineageQueryError):
+            sim.lineage(0, "R1")
 
 
 if __name__ == "__main__":

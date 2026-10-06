@@ -55,6 +55,16 @@
         <ol id="timeline" class="timeline"></ol>
       </div>
       <div class="col col-wide">
+        <div class="lineage-bar">
+          <h3>数据来源谱系</h3>
+          <label class="small" for="reg-select">体系结构寄存器
+            <select id="reg-select"></select>
+          </label>
+          <span id="lineage-status" class="status-line"></span>
+        </div>
+        <div id="lineage-view" class="lineage-view">
+          <p class="placeholder">选择时间线中已执行的步骤与一个体系结构寄存器后，在此展开该步物理结果到产生者指令及源操作数的依赖谱系。</p>
+        </div>
         <div id="detail" class="detail">
           <p class="placeholder">执行后在此展开首个违规事件（或任一步）前后的映射表、ROB 与回收寄存器证据。</p>
         </div>

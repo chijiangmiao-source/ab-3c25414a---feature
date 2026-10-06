@@ -6,6 +6,9 @@
 * 纯 Python 标准库实现（无第三方运行时依赖）
 * 维护：ROB 顺序、重命名映射表、空闲物理寄存器表、每个条件分支的检查点
 * 自动定位**首个违规事件**，展开事件前后映射表、ROB、检查点与回收寄存器证据
+* **数据来源谱系查询**：选定已执行步骤与体系结构寄存器后，按该步当时的映射
+  返回稳定排序的依赖 DAG，一路追溯到产生者指令与其分派时捕获的源操作数；
+  物理寄存器复用以**分配代次**区分，回滚/重取不会误接数据源
 * 网页 + REST API（支持一次性复核与逐步真实 API 查看状态）
 * Docker / Compose 一键起页面；`verify` 服务运行构建检查、代码测试与 API/HTTP
   冒烟后以结果码退出
@@ -80,9 +83,21 @@ PORT=9090 python3 -m app     # 可配置端口
 | POST | `/api/sessions` | 建立逐步复核会话 |
 | POST | `/api/sessions/<id>/step` | 推进一个事件（真实逐步状态） |
 | POST | `/api/sessions/<id>/reset` | 复位到事件 0 |
+| GET | `/api/sessions/<id>/lineage?step=<n>&reg=Rk` | 按目标步骤当时的映射查询数据来源谱系 DAG |
+| POST | `/api/lineage` | 无状态重放到指定步后查询谱系（一次性复核同视图） |
 | GET | `/api/sessions/<id>` | 查看会话当前状态 |
 
-请求体：`{"program": "...", "events": "...", "num_phys": 16}`。
+请求体：`{"program": "...", "events": "...", "num_phys": 16}`。`POST /api/lineage`
+额外接受 `step`（事件下标，含）与 `reg`（`R0`..`R7`）。
+
+### 谱系查询拒绝码
+
+| 代码 | 场景 |
+|---|---|
+| `LINEAGE_STEP_OUT_OF_RANGE` | 步骤越过当前会话游标（未执行）、下标为负或参数格式错误 |
+| `LINEAGE_INVALID_REGISTER` | 寄存器不是 R0..R7 |
+| `LINEAGE_AFTER_VIOLATION` | 查询首个违规事件本身或其后的步骤，复核已在该处终止 |
+| `LINEAGE_UNKNOWN_SESSION` | 会话不存在（HTTP 404） |
 
 ## Docker / Compose
 
@@ -108,7 +123,7 @@ docker compose up --build --abort-on-container-exit verify
 ```bash
 bash scripts/verify.sh                      # 自启临时服务器并冒烟
 TARGET_URL=http://host:port bash scripts/verify.sh
-python3 -m unittest discover -s tests -v    # 仅单元/API 测试（45 项）
+python3 -m unittest discover -s tests -v    # 仅单元/API 测试（58 项）
 python3 scripts/smoke.py http://127.0.0.1:8080
 ```
 

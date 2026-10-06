@@ -12,6 +12,11 @@ POST /api/sessions           create an incremental review session
 GET  /api/sessions/<id>      current session state (steps up to cursor)
 POST /api/sessions/<id>/step advance one event
 POST /api/sessions/<id>/reset  restart the replay at event 0
+GET  /api/sessions/<id>/lineage?step=<n>&reg=Rk
+                             dependency DAG of Rk's physical value as mapped
+                             after executed event n (generations disambiguate
+                             physical-register reuse after rollback)
+POST /api/lineage            stateless replay to one step, then lineage query
 
 The port is configurable through the PORT environment variable (default 8080).
 Only Python standard library is required.
@@ -24,10 +29,12 @@ import os
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from .simulator import (
+    ARCH_REGS,
     DEFAULT_NUM_PHYS,
+    LineageQueryError,
     Violation,
     parse_events,
     parse_program,
@@ -103,10 +110,65 @@ class Session:
             self.steps = []
             return {"reset": True}
 
+    def lineage(self, step_index: int, arch: int) -> dict:
+        with self.lock:
+            cursor = len(self.steps)
+            violation_step = next(
+                (i for i, s in enumerate(self.steps) if s["violation"]), None
+            )
+            if not isinstance(step_index, int) or step_index < 0 \
+                    or step_index >= cursor:
+                raise LineageQueryError(
+                    "LINEAGE_STEP_OUT_OF_RANGE",
+                    f"step must be an executed event index in 0..{cursor - 1}; "
+                    f"got {step_index!r} (session cursor {cursor}/{len(self.events)})",
+                )
+            if violation_step is not None and step_index >= violation_step:
+                raise LineageQueryError(
+                    "LINEAGE_AFTER_VIOLATION",
+                    f"step {step_index} is the first violation event "
+                    f"(#{violation_step}, "
+                    f"{self.steps[violation_step]['violation']['code']}) or lies "
+                    "after it: the review stopped there and no lineage is served",
+                )
+            dag = self.sim.lineage(step_index, arch)
+            dag["session_id"] = self.id
+            dag["cursor"] = cursor
+            dag["total_events"] = len(self.events)
+            dag["violation_step"] = violation_step
+            return dag
+
 
 def _public_step(step: dict) -> dict:
     # Steps are already plain dicts; kept as a seam in case the schema evolves.
     return step
+
+
+def _parse_reg_arg(raw) -> int:
+    """Parse 'R3' / 'r3' / '3' into an architectural register index 0..7."""
+    if raw is None:
+        raise LineageQueryError("LINEAGE_INVALID_REGISTER", "missing 'reg' (R0..R7)")
+    t = str(raw).strip().upper()
+    if t.startswith("R"):
+        t = t[1:]
+    if not t.isdigit():
+        raise LineageQueryError(
+            "LINEAGE_INVALID_REGISTER", f"bad register {raw!r}, expected R0..R7")
+    arch = int(t)
+    if not 0 <= arch < ARCH_REGS:
+        raise LineageQueryError(
+            "LINEAGE_INVALID_REGISTER", f"register R{arch} out of range (R0..R7)")
+    return arch
+
+
+def _parse_step_arg(raw) -> int:
+    if raw is None:
+        raise LineageQueryError("LINEAGE_STEP_OUT_OF_RANGE", "missing 'step'")
+    t = str(raw).strip()
+    if not t.lstrip("-").isdigit():
+        raise LineageQueryError("LINEAGE_STEP_OUT_OF_RANGE",
+                                f"bad step {raw!r}, expected an event index")
+    return int(t)
 
 
 def _build_inputs(payload) -> tuple:
@@ -194,6 +256,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_static(rel, CONTENT_TYPES.get(ext, "application/octet-stream"))
             elif path.startswith("/api/sessions/"):
                 rest = path[len("/api/sessions/"):]
+                parts = [p for p in rest.split("/") if p]
+                if len(parts) == 2 and parts[1] == "lineage":
+                    sid = parts[0]
+                    with _sessions_lock:
+                        session = _sessions.get(sid)
+                    if session is None:
+                        self._send_json(
+                            {"error": {"code": "LINEAGE_UNKNOWN_SESSION",
+                                       "message": f"unknown session {sid}"}}, 404)
+                        return
+                    query = parse_qs(parsed.query)
+                    try:
+                        step_index = _parse_step_arg(query.get("step", [None])[0])
+                        arch = _parse_reg_arg(query.get("reg", [None])[0])
+                        dag = session.lineage(step_index, arch)
+                    except LineageQueryError as exc:
+                        self._send_json({"error": exc.to_dict()}, exc.status)
+                        return
+                    self._send_json({"ok": True, "lineage": dag})
+                    return
                 sid = rest.strip("/")
                 with _sessions_lock:
                     session = _sessions.get(sid)
@@ -230,6 +312,39 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 report = simulate(instructions, events, num_phys)
                 self._send_json(report)
+            elif path == "/api/lineage":
+                payload = self._read_json()
+                try:
+                    instructions, events, num_phys = _build_inputs(payload)
+                    step_index = _parse_step_arg(payload.get("step"))
+                    arch = _parse_reg_arg(payload.get("reg"))
+                except (ValueError, LineageQueryError) as exc:
+                    if isinstance(exc, LineageQueryError):
+                        self._send_json({"error": exc.to_dict()}, exc.status)
+                    else:
+                        self._send_json({"error": str(exc)}, 400)
+                    return
+                if step_index < 0 or step_index >= len(events):
+                    self._send_json({"error": {
+                        "code": "LINEAGE_STEP_OUT_OF_RANGE",
+                        "message": f"step {step_index} is outside the trace "
+                                   f"(0..{len(events) - 1})"}}, 400)
+                    return
+                # Stateless replay: stop at the requested step, refusing to
+                # cross a first violation event.
+                sim = Simulator(instructions, num_phys)
+                for i in range(step_index + 1):
+                    rec = sim.step(events[i])
+                    if rec["violation"]:
+                        self._send_json({"error": {
+                            "code": "LINEAGE_AFTER_VIOLATION",
+                            "message": f"step {i} is the first violation event "
+                                       f"({rec['violation']['code']}); lineage is only "
+                                       "served for steps before it"}}, 422)
+                        return
+                dag = sim.lineage(step_index, arch)
+                dag["total_events"] = len(events)
+                self._send_json({"ok": True, "lineage": dag})
             elif path == "/api/sessions":
                 payload = self._read_json()
                 try:
@@ -244,25 +359,40 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/sessions/"):
                 rest = path[len("/api/sessions/"):]
                 parts = [p for p in rest.split("/") if p]
-                if len(parts) == 2 and parts[1] in ("step", "reset"):
+                if len(parts) == 2 and parts[1] in ("step", "reset", "lineage"):
                     sid = parts[0]
                     with _sessions_lock:
                         session = _sessions.get(sid)
                     if session is None:
-                        self._send_json({"error": f"unknown session {sid}"}, 404)
+                        self._send_json(
+                            {"error": {"code": "LINEAGE_UNKNOWN_SESSION",
+                                       "message": f"unknown session {sid}"}}, 404)
                         return
-                    if parts[1] == "step":
+                    action = parts[1]
+                    if action == "step":
                         result = session.advance()
                         self._send_json({"ok": True, **result, "state": session.to_state()})
-                    else:
+                    elif action == "reset":
                         session.reset()
                         self._send_json({"ok": True, "state": session.to_state()})
+                    else:
+                        query = parse_qs(parsed.query)
+                        try:
+                            step_index = _parse_step_arg(query.get("step", [None])[0])
+                            arch = _parse_reg_arg(query.get("reg", [None])[0])
+                            dag = session.lineage(step_index, arch)
+                        except LineageQueryError as exc:
+                            self._send_json({"error": exc.to_dict()}, exc.status)
+                            return
+                        self._send_json({"ok": True, "lineage": dag})
                 else:
                     self._send_json({"error": "not found", "path": path}, 404)
             else:
                 self._send_json({"error": "not found", "path": path}, 404)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, 400)
+        except LineageQueryError as exc:
+            self._send_json({"error": exc.to_dict()}, exc.status)
         except Violation as exc:  # pragma: no cover - simulate path handles these
             self._send_json({"error": exc.to_dict()}, 422)
         except Exception as exc:  # pragma: no cover - defensive

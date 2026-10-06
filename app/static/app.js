@@ -138,6 +138,9 @@ const els = {
   banner: document.getElementById("violation-banner"),
   timeline: document.getElementById("timeline"),
   detail: document.getElementById("detail"),
+  regSelect: document.getElementById("reg-select"),
+  lineageView: document.getElementById("lineage-view"),
+  lineageStatus: document.getElementById("lineage-status"),
   btnValidate: document.getElementById("btn-validate"),
   btnSimulate: document.getElementById("btn-simulate"),
   btnSession: document.getElementById("btn-session"),
@@ -150,7 +153,9 @@ let state = {
   violationStep: null,
   selected: -1,
   sessionId: null,
-  instructions: []
+  mode: null, // "session" | "oneshot"
+  instructions: [],
+  lineageReg: 0
 };
 
 function initExamples() {
@@ -198,7 +203,8 @@ async function api(path, method, body) {
   let data = null;
   try { data = await res.json(); } catch (_) { /* leave null */ }
   if (!res.ok) {
-    const msg = data && (data.error || (data.violation && data.violation.message)) || `HTTP ${res.status}`;
+    let msg = data && (data.error || (data.violation && data.violation.message)) || `HTTP ${res.status}`;
+    if (typeof msg === "object") msg = msg.message || JSON.stringify(msg);
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
   }
   return data;
@@ -215,7 +221,21 @@ function clearResult() {
   els.banner.classList.add("hidden");
 }
 
+function initRegSelect() {
+  for (let r = 0; r < 8; r++) {
+    const opt = document.createElement("option");
+    opt.value = String(r);
+    opt.textContent = `R${r}`;
+    els.regSelect.appendChild(opt);
+  }
+  els.regSelect.addEventListener("change", () => {
+    state.lineageReg = Number(els.regSelect.value);
+    refreshLineage();
+  });
+}
+
 function renderReport(report) {
+  state.mode = "oneshot";
   state.steps = report.steps || [];
   state.instructions = report.instructions || [];
   state.violationStep = report.violation_step;
@@ -266,6 +286,7 @@ function selectStep(i) {
     li.classList.toggle("selected", idx === i));
   els.detail.innerHTML = "";
   els.detail.appendChild(renderStepDetail(step));
+  refreshLineage();
 }
 
 function mapTable(snap, changedCols) {
@@ -503,6 +524,162 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// ---------------------------------------------------------------- lineage
+
+function setLineageStatus(msg, kind) {
+  els.lineageStatus.textContent = msg || "";
+  els.lineageStatus.className = "status-line" + (kind ? " " + kind : "");
+}
+
+function lineagePlaceholder(text, cls) {
+  els.lineageView.innerHTML =
+    `<p class="placeholder ${cls || ""}">${escapeHtml(text)}</p>`;
+}
+
+async function refreshLineage() {
+  const step = state.selected;
+  if (step < 0 || !state.mode) {
+    lineagePlaceholder("请先在时间线选择一个已执行步骤。");
+    setLineageStatus("");
+    return;
+  }
+  if (state.violationStep !== null && step >= state.violationStep) {
+    lineagePlaceholder(
+      `步骤 #${step} 是首个违规事件或在其后：复核已在 #${state.violationStep} 终止，拒绝谱系查询。`,
+      "lineage-denied");
+    setLineageStatus("已拒绝：首个违规事件之后", "err");
+    return;
+  }
+  const reg = state.lineageReg;
+  setLineageStatus("查询谱系…");
+  try {
+    let dag;
+    if (state.mode === "session" && state.sessionId) {
+      const r = await api(
+        `/api/sessions/${state.sessionId}/lineage?step=${step}&reg=R${reg}`);
+      dag = r.lineage;
+    } else {
+      const r = await api("/api/lineage", "POST", {
+        ...payload(), step, reg: `R${reg}`
+      });
+      dag = r.lineage;
+    }
+    renderLineage(dag);
+    setLineageStatus(`事件 #${step} · R${reg} → P${dag.target_tag}` +
+      `（第 ${dag.target_generation} 代分配）`, "ok");
+  } catch (e) {
+    lineagePlaceholder(`查询被拒绝：${e.message}`, "lineage-denied");
+    setLineageStatus(e.message, "err");
+  }
+}
+
+function renderLineage(dag) {
+  els.lineageView.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "lineage-head";
+  head.innerHTML =
+    `事件 #${dag.step} 后 <strong>${dag.register}</strong> 的物理结果 ` +
+    `<span class="tag">P${dag.target_tag}</span>（分配代次 ${dag.target_generation}）`;
+  els.lineageView.appendChild(head);
+
+  const byId = {};
+  for (const n of dag.nodes) byId[n.id] = n;
+  // provenance edges point source -> consumer; expanding a node reveals the
+  // sources captured at that node's dispatch
+  const sources = {};
+  for (const n of dag.nodes) sources[n.id] = [];
+  for (const e of dag.edges) {
+    sources[e.to].push(e);
+  }
+
+  const tree = document.createElement("div");
+  tree.className = "lin-tree";
+
+  function makeNode(nodeId, incomingEdge) {
+    const n = byId[nodeId];
+    const li = document.createElement("div");
+    li.className = "lin-node-wrap";
+    const card = document.createElement("div");
+    card.className = "lin-card kind-" + n.kind +
+      (n.id === dag.root ? " root" : "") +
+      (n.squashed ? " squashed" : "") +
+      (n.eventually_squashed ? " doomed" : "") +
+      (n.committed ? " committed" : "");
+
+    let title;
+    if (n.kind === "initial") {
+      title = `<span class="lin-kind">初始</span> ${n.name}`;
+    } else {
+      title = `<span class="lin-kind">动态实例</span> I${n.seq} ` +
+        `<span class="lin-op">${escapeHtml(n.name)}</span>`;
+    }
+    card.innerHTML =
+      `<div class="lin-title">${title}</div>
+       <div class="lin-meta">
+         分派事件：${n.dispatch_event_index === null ? "—" : "#" + n.dispatch_event_index}
+         · 目标物理寄存器：<span class="tag">P${n.tag}</span>
+         · 分配代次：${n.generation}
+         ${n.old_tag !== null ? `· 旧标签 <span class="tag-old">P${n.old_tag}</span>` : ""}
+       </div>`;
+
+    if (incomingEdge) {
+      const tag = document.createElement("div");
+      tag.className = "lin-edge-tag";
+      tag.innerHTML = `源操作数 Rs${incomingEdge.operand} ` +
+        `R${incomingEdge.arch} → 分派时映射 <span class="tag">P${incomingEdge.tag}</span>` +
+        `（代次 ${incomingEdge.generation}，捕获于事件 #${incomingEdge.captured_at_dispatch_event}）`;
+      li.appendChild(tag);
+    }
+
+    const srcEdges = (sources[nodeId] || [])
+      .slice()
+      .sort((a, b) => a.operand - b.operand);
+    const expandable = srcEdges.length > 0;
+    const headerWrap = document.createElement("div");
+    headerWrap.className = "lin-head-row";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "lin-toggle";
+    toggle.textContent = expandable ? "▾" : "•";
+    toggle.disabled = !expandable;
+    headerWrap.appendChild(toggle);
+    headerWrap.appendChild(card);
+    li.appendChild(headerWrap);
+
+    if ((n.squashed || n.eventually_squashed) && n.squash) {
+      const note = document.createElement("div");
+      note.className = "lin-squash";
+      const prefix = n.squashed ? "清除说明："
+        : `后续事件 #${n.squash_event_index} 将清除该实例（本步映射仍有效）：`;
+      note.textContent = prefix + n.squash.description;
+      li.appendChild(note);
+    }
+    if (n.committed) {
+      const note = document.createElement("div");
+      note.className = "lin-commit-note";
+      note.textContent = `该实例已在事件 #${n.commit_event_index} 提交。`;
+      li.appendChild(note);
+    }
+
+    if (expandable) {
+      const sub = document.createElement("div");
+      sub.className = "lin-children";
+      for (const e of srcEdges) {
+        sub.appendChild(makeNode(e.from, e));
+      }
+      li.appendChild(sub);
+      toggle.addEventListener("click", () => {
+        const collapsed = sub.classList.toggle("collapsed");
+        toggle.textContent = collapsed ? "▸" : "▾";
+      });
+    }
+    return li;
+  }
+
+  tree.appendChild(makeNode(dag.root, null));
+  els.lineageView.appendChild(tree);
+}
+
 // ---------------------------------------------------------------- sessions
 
 function setSessionButtons(active) {
@@ -512,6 +689,7 @@ function setSessionButtons(active) {
 }
 
 async function loadSessionState(s) {
+  state.mode = "session";
   state.steps = s.steps;
   state.instructions = s.instructions;
   state.violationStep = s.violation ? s.cursor - 1 : null;
@@ -602,3 +780,4 @@ els.btnStep.addEventListener("click", stepSession);
 els.btnReset.addEventListener("click", resetSession);
 
 initExamples();
+initRegSelect();

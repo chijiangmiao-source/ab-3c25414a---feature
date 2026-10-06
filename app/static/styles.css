@@ -228,3 +228,90 @@ table.state tr.section td { background: #121a2c; color: #9db1dd; text-align: lef
   font-size: 12px;
   padding: 10px 22px 20px;
 }
+
+/* lineage -------------------------------------------------------------- */
+.lineage-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.lineage-bar h3 { margin: 0; font-size: 13px; color: #c7d3ee; }
+.lineage-view {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  background: #0d1322;
+  min-height: 70px;
+}
+.lineage-view .placeholder { color: var(--muted); margin: 0; }
+.lineage-view .placeholder.lineage-denied { color: var(--bad); }
+.lineage-head {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border);
+}
+
+.lin-tree { font-family: var(--mono); font-size: 12px; }
+.lin-children {
+  margin-left: 14px;
+  padding-left: 12px;
+  border-left: 1px dotted #3a4a72;
+  display: grid;
+  gap: 6px;
+  margin-top: 6px;
+}
+.lin-children.collapsed { display: none; }
+.lin-head-row { display: flex; align-items: flex-start; gap: 6px; }
+.lin-toggle {
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 18px;
+  height: 20px;
+  margin-top: 2px;
+}
+.lin-toggle:disabled { color: var(--muted); border-color: transparent; background: transparent; }
+.lin-card {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 9px;
+  background: var(--panel);
+  flex: 1;
+}
+.lin-card.root { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,157,255,0.25); }
+.lin-card.kind-initial { background: #101a2a; }
+.lin-card.squashed { border-color: #7a3b3b; background: rgba(255,93,93,0.07); }
+.lin-card.doomed { border-style: dashed; border-color: #7a5a3b; }
+.lin-card.committed { border-color: #2c6b46; }
+.lin-kind {
+  font-size: 10.5px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 7px;
+  margin-right: 4px;
+}
+.lin-card.kind-initial .lin-kind { color: #8ec9ff; }
+.lin-card.squashed .lin-kind { color: #ff8b8b; border-color: #7a3b3b; }
+.lin-op { color: #c7d3ee; }
+.lin-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.lin-edge-tag {
+  margin: 3px 0 3px 26px;
+  font-size: 11px;
+  color: #a9c4ff;
+}
+.lin-squash {
+  margin: 4px 0 0 26px;
+  font-size: 11px;
+  color: #ff8b8b;
+  font-family: var(--mono);
+}
+.lin-commit-note {
+  margin: 4px 0 0 26px;
+  font-size: 11px;
+  color: var(--ok);
+}

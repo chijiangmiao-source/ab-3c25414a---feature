@@ -140,6 +140,131 @@ class HttpApiTests(unittest.TestCase):
         with ServerHarness() as h:
             h.request("/api/sessions/nope/step", "POST", expect_status=404)
 
+    def test_lineage_reuse_after_mispredict_session(self):
+        # I2 writes R2 (P9), gets squashed by branch I1, then I4 re-fetches
+        # R2 and reuses the same physical tag P9 — the historical query at
+        # the earlier step must still point at I2, not I4.
+        prog = """
+        ADD R1,R0,R0
+        BEQ R1,R0 predict=taken
+        ADD R2,R1,R0
+        ADD R3,R2,R0
+        ADD R2,R1,R0
+        """
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        dispatch I3
+        writeback I0
+        writeback I1
+        commit I0
+        resolve I1 not-taken
+        dispatch I4
+        """
+        with ServerHarness() as h:
+            _, s = h.request("/api/sessions", "POST",
+                             {"program": prog, "events": events}, 201)
+            sid = s["id"]
+            for _ in range(9):
+                h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=2&reg=R2", expect_status=200)
+            dag = body["lineage"]
+            self.assertEqual(dag["root"], "dyn:I2")
+            self.assertEqual(dag["target_tag"], 9)
+            self.assertEqual(dag["target_generation"], 1)
+
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=8&reg=R2", expect_status=200)
+            dag = body["lineage"]
+            self.assertEqual(dag["root"], "dyn:I4")
+            self.assertEqual(dag["target_tag"], 9)
+            self.assertEqual(dag["target_generation"], 2)
+            self.assertNotIn("dyn:I2", {n["id"] for n in dag["nodes"]})
+
+            # edge captured at dispatch: I4 read R1 -> I0's tag
+            edge = next(e for e in dag["edges"] if e["to"] == "dyn:I4"
+                        and e["operand"] == 0)
+            self.assertEqual(edge["from"], "dyn:I0")
+            self.assertEqual(edge["tag"], 8)
+
+    def test_lineage_exception_restore(self):
+        prog = ("ADD R1,R0,R0\nADD R2,R1,R0\nMUL R3,R1,R2\n"
+                "ADD R4,R3,R1\nSUB R5,R4,R3\n")
+        events = ("dispatch I0\ndispatch I1\ndispatch I2\ndispatch I3\ndispatch I4\n"
+                  "writeback I0\ncommit I0\nwriteback I1\nwriteback I2\n"
+                  "exception I2\nwriteback I3\ncommit I1")
+        with ServerHarness() as h:
+            _, s = h.request("/api/sessions", "POST",
+                             {"program": prog, "events": events}, 201)
+            sid = s["id"]
+            for _ in range(12):
+                h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+            # precise rollback drains once commit moves faulting I2 to head
+            # (step 11); R3 then points at the initial value, committed I0 survives
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=11&reg=R3", expect_status=200)
+            self.assertEqual(body["lineage"]["root"], "initial:R3")
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=11&reg=R1", expect_status=200)
+            self.assertEqual(body["lineage"]["root"], "dyn:I0")
+
+    def test_lineage_rejections(self):
+        with ServerHarness() as h:
+            _, s = h.request("/api/sessions", "POST",
+                             {"program": PROG, "events": EVENTS_BAD}, 201)
+            sid = s["id"]
+            for _ in range(11):
+                h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+
+            # beyond the cursor
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=11&reg=R1", expect_status=400)
+            self.assertEqual(body["error"]["code"], "LINEAGE_STEP_OUT_OF_RANGE")
+            # invalid register
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=0&reg=R9", expect_status=400)
+            self.assertEqual(body["error"]["code"], "LINEAGE_INVALID_REGISTER")
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=0&reg=foo", expect_status=400)
+            self.assertEqual(body["error"]["code"], "LINEAGE_INVALID_REGISTER")
+            # first violation event (step 10) and beyond
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=10&reg=R1", expect_status=400)
+            self.assertEqual(body["error"]["code"], "LINEAGE_AFTER_VIOLATION")
+            # unknown session
+            h.request("/api/sessions/ghost/lineage?step=0&reg=R1",
+                      expect_status=404)
+
+    def test_lineage_rejected_before_cursor(self):
+        with ServerHarness() as h:
+            _, s = h.request("/api/sessions", "POST",
+                             {"program": PROG, "events": EVENTS_OK}, 201)
+            sid = s["id"]
+            h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+            # step 5 not executed yet (cursor 1)
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=5&reg=R1", expect_status=400)
+            self.assertEqual(body["error"]["code"], "LINEAGE_STEP_OUT_OF_RANGE")
+
+    def test_lineage_stateless_post(self):
+        with ServerHarness() as h:
+            status, body = h.request("/api/lineage", "POST", {
+                "program": PROG, "events": EVENTS_OK, "step": 3, "reg": "R3"}, 200)
+            dag = body["lineage"]
+            self.assertEqual(dag["root"], "dyn:I3")
+            self.assertEqual(dag["nodes"][0]["dispatch_event_index"], 0)
+            # beyond trace
+            h.request("/api/lineage", "POST",
+                      {"program": PROG, "events": EVENTS_OK, "step": 99, "reg": "R3"},
+                      expect_status=400)
+            # first violation event refused for one-shot too
+            status, body = h.request("/api/lineage", "POST", {
+                "program": PROG, "events": EVENTS_BAD, "step": 10, "reg": "R3"}, 422)
+            self.assertEqual(body["error"]["code"], "LINEAGE_AFTER_VIOLATION")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -20,6 +20,16 @@ Models a checkpoint-based rename / ROB machine:
 
 The replay stops at the first violating event and keeps before/after
 evidence (map table, ROB, free list, checkpoints, reclaimed tags).
+
+Every physical-tag allocation carries a monotonically increasing
+allocation generation, and each destination-renaming dispatch is recorded
+as a DynamicInstance whose source operands freeze the (tag, generation)
+mapping read at dispatch time. Post-event versioned map snapshots let
+``Simulator.lineage(step, arch)`` reconstruct the stable, topologically
+sorted producer DAG exactly as mapped at any executed step — a later
+dispatch reusing a freed physical register gets a new generation and can
+never be mistaken for an earlier value's producer, including after branch
+misprediction or precise-exception recovery.
 """
 
 from __future__ import annotations
@@ -48,6 +58,74 @@ class Violation(Exception):
 
     def to_dict(self) -> dict:
         return {"code": self.code, "message": self.message, "evidence": self.evidence}
+
+
+class LineageQueryError(Exception):
+    """A register-lineage query references a step/register that cannot be served."""
+
+    def __init__(self, code: str, message: str, status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+
+    def to_dict(self) -> dict:
+        return {"code": self.code, "message": self.message}
+
+
+def initial_instance_id(arch: int) -> str:
+    return f"initial:R{arch}"
+
+
+def dynamic_instance_id(seq: int) -> str:
+    return f"dyn:I{seq}"
+
+
+@dataclass
+class DynamicInstance:
+    """One dynamic dispatch that renamed a destination register.
+
+    ``sources`` captures the rename mapping exactly as it read its source
+    operands at dispatch time, so the provenance edges stay valid even after
+    later rollbacks reuse or reclaim the same physical tags.
+    """
+
+    id: str
+    seq: int
+    op: str
+    name: str
+    arch: int                  # destination architectural register
+    tag: int                   # physical tag allocated at dispatch
+    old_tag: Optional[int]
+    generation: int            # allocation generation of ``tag``
+    dispatch_event_index: int
+    sources: list              # list[{"operand","arch","tag","instance"}]
+    committed: bool = False
+    commit_event_index: Optional[int] = None
+    squashed: bool = False
+    squash_event_index: Optional[int] = None
+    squash_detail: Optional[dict] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "kind": "dynamic",
+            "seq": self.seq,
+            "op": self.op,
+            "name": self.name,
+            "arch": self.arch,
+            "register": f"R{self.arch}",
+            "tag": self.tag,
+            "old_tag": self.old_tag,
+            "generation": self.generation,
+            "dispatch_event_index": self.dispatch_event_index,
+            "committed": self.committed,
+            "commit_event_index": self.commit_event_index,
+            "squashed": self.squashed,
+            "squash_event_index": self.squash_event_index,
+            "squash": self.squash_detail,
+            "sources": [dict(s) for s in self.sources],
+        }
 
 
 @dataclass
@@ -94,8 +172,10 @@ class Event:
 class RobEntry:
     seq: int
     instr: Instruction
-    tag: int
+    tag: Optional[int]
     old_tag: Optional[int]
+    gen: int = 0
+    old_gen: int = 0
     done: bool = False
     resolved: bool = False
     taken: Optional[bool] = None
@@ -297,6 +377,26 @@ class Simulator:
         self.processed = 0
         self.rollback_log = []   # precise-exception rollbacks performed
 
+        # -- provenance / lineage bookkeeping -------------------------------
+        # Every physical tag carries an allocation generation, incremented
+        # each time the tag is handed out by the free list. A lineage node is
+        # identified by (tag, generation) so a later dispatch reusing the
+        # same physical register can never be mistaken for the producer of a
+        # value read earlier.
+        self.tag_generation = [0] * num_phys
+        # (tag, generation) -> DynamicInstance, for dispatched producers.
+        self.instances: dict[tuple, DynamicInstance] = {}
+        # seq -> instance id, including squashed producers (for evidence).
+        self.instance_by_seq: dict[int, DynamicInstance] = {}
+        # instance id -> DynamicInstance
+        self.instance_by_id: dict[str, DynamicInstance] = {}
+        # Map table as (tag, generation) pairs per architectural register;
+        # initial tags are generation 0.
+        self.map_table_vers = [(r, 0) for r in range(ARCH_REGS)]
+        # Event-index -> full map snapshot taken *after* that event (index 0
+        # is the state before any event). Serves historical lineage queries.
+        self.map_history: list[list[tuple]] = [list(self.map_table_vers)]
+
     # -- snapshots ----------------------------------------------------------
 
     def snapshot(self) -> dict:
@@ -322,6 +422,160 @@ class Simulator:
         if entry is not None and entry in self.rob:
             return entry
         return None
+
+    def _producer_id(self, tag: int, generation: int) -> str:
+        """Node id of the instruction that produced (tag, generation).
+
+        Physical tags P0..P7 at generation 0 are the initial architectural
+        values; every later allocation has a DynamicInstance recorded.
+        """
+        inst = self.instances.get((tag, generation))
+        if inst is not None:
+            return inst.id
+        if tag < ARCH_REGS and generation == 0:
+            return initial_instance_id(tag)
+        return f"unknown:P{tag}#g{generation}"
+
+    def _mark_squashed(self, seq: int, detail: dict) -> None:
+        inst = self.instance_by_seq.get(seq)
+        if inst is not None:
+            inst.squashed = True
+            inst.squash_event_index = self.processed
+            inst.squash_detail = dict(detail)
+
+    def _initial_node(self, arch: int) -> dict:
+        return {
+            "id": initial_instance_id(arch),
+            "kind": "initial",
+            "seq": None,
+            "op": None,
+            "name": f"初始寄存器 R{arch}",
+            "register": f"R{arch}",
+            "arch": arch,
+            "tag": arch,
+            "old_tag": None,
+            "generation": 0,
+            "dispatch_event_index": None,
+            "committed": False,
+            "commit_event_index": None,
+            "squashed": False,
+            "squash_event_index": None,
+            "squash": None,
+            "sources": [],
+        }
+
+    def lineage(self, step_index: int, arch: int) -> dict:
+        """Return the stable, topological-sort dependency DAG that produced
+        architectural register ``arch``'s physical value after executed
+        event ``step_index`` (0-based, inclusive).
+
+        Every node is either an initial architectural register or one
+        dynamic dispatch instance (tag + allocation generation); every edge
+        is a source mapping frozen at the producer's dispatch. Squashed or
+        later refetched instructions can never appear as producers because
+        the historical map snapshot restores the exact post-event mapping,
+        including generations.
+        """
+        if not isinstance(step_index, int) or step_index < 0 \
+                or step_index >= len(self.map_history) - 1:
+            raise LineageQueryError(
+                "LINEAGE_STEP_OUT_OF_RANGE",
+                f"step {step_index!r} is outside the executed session cursor "
+                f"(0..{len(self.map_history) - 2})",
+                status=400,
+            )
+        if not isinstance(arch, int) or not 0 <= arch < ARCH_REGS:
+            raise LineageQueryError(
+                "LINEAGE_INVALID_REGISTER",
+                f"register must be R0..R{ARCH_REGS - 1}, got {arch!r}",
+                status=400,
+            )
+
+        target_tag, target_gen = self.map_history[step_index + 1][arch]
+        root_id = self._producer_id(target_tag, target_gen)
+
+        nodes: dict[str, dict] = {}
+        edges: list[dict] = []
+
+        def add_node(node_id: str):
+            if node_id in nodes:
+                return
+            if node_id.startswith("initial:"):
+                r = int(node_id.split("R", 1)[1])
+                nodes[node_id] = self._initial_node(r)
+                return
+            inst = self.instance_by_id.get(node_id)
+            if inst is None:
+                # Defensive: source points at a (tag, generation) that no
+                # dispatch in this session produced and is not an initial tag.
+                nodes[node_id] = {
+                    "id": node_id, "kind": "unknown", "seq": None, "op": None,
+                    "name": node_id, "register": None, "arch": None,
+                    "tag": None, "old_tag": None, "generation": None,
+                    "dispatch_event_index": None, "committed": False,
+                    "commit_event_index": None, "squashed": False,
+                    "squash_event_index": None, "squash": None, "sources": [],
+                }
+                return
+            d = inst.to_dict()
+            # Status is reported as of the queried step: an instance cleared
+            # by a later rollback was still live at earlier steps, while the
+            # full clearance explanation is retained alongside.
+            d["eventually_squashed"] = (
+                inst.squash_event_index is not None
+                and inst.squash_event_index > step_index
+            )
+            d["squashed"] = (
+                inst.squash_event_index is not None
+                and inst.squash_event_index <= step_index
+            )
+            d["committed"] = (
+                inst.commit_event_index is not None
+                and inst.commit_event_index <= step_index
+            )
+            nodes[node_id] = d
+            for src in inst.sources:
+                edges.append({
+                    "from": src["instance"],
+                    "to": inst.id,
+                    "operand": src["operand"],
+                    "arch": src["arch"],
+                    "tag": src["tag"],
+                    "generation": src["generation"],
+                    "captured_at_dispatch_event": inst.dispatch_event_index,
+                })
+                add_node(src["instance"])
+
+        add_node(root_id)
+
+        # Stable ordering: nodes by dispatch event then id; edges by target
+        # dispatch event, operand position, then source id.
+        def node_key(n: dict):
+            order = {"dynamic": 0, "initial": 1, "unknown": 2}
+            return (order[n["kind"]],
+                    n["dispatch_event_index"] if n["dispatch_event_index"] is not None else -1,
+                    n["id"])
+
+        ordered_nodes = sorted(nodes.values(), key=node_key)
+        ordered_edges = sorted(
+            edges,
+            key=lambda e: (e["captured_at_dispatch_event"], e["operand"], e["from"]),
+        )
+        node_order = {n["id"]: i for i, n in enumerate(ordered_nodes)}
+        for e in ordered_edges:
+            e["from_index"] = node_order[e["from"]]
+            e["to_index"] = node_order[e["to"]]
+
+        return {
+            "step": step_index,
+            "register": f"R{arch}",
+            "arch": arch,
+            "target_tag": target_tag,
+            "target_generation": target_gen,
+            "root": root_id,
+            "nodes": ordered_nodes,
+            "edges": ordered_edges,
+        }
 
     # -- event application --------------------------------------------------
 
@@ -366,9 +620,13 @@ class Simulator:
         # destination tag; branches consume no free-list entry.
         tag = self.free_list.pop(0) if instr.dest is not None else None
         old_tag = self.map_table[instr.dest] if instr.dest is not None else None
+        old_gen = self.map_table_vers[instr.dest][1] if instr.dest is not None else 0
 
-        # Source operands read through the current rename mapping.
+        # Source operands read through the current rename mapping. The same
+        # mapping, tagged with allocation generations, is frozen on the
+        # dynamic instance as provenance edges.
         src_tags = [self.map_table[s] for s in instr.srcs]
+        src_vers = [self.map_table_vers[s] for s in instr.srcs]
 
         checkpoint = None
         if instr.is_branch:
@@ -377,15 +635,44 @@ class Simulator:
             # re-fetched path must see.
             checkpoint = {
                 "map_table": list(self.map_table),
+                "map_table_vers": list(self.map_table_vers),
                 "free_list": sorted(self.free_list),
             }
             self.checkpoints[seq] = checkpoint
 
-        entry = RobEntry(seq=seq, instr=instr, tag=tag, old_tag=old_tag)
+        generation = 0
+        if tag is not None:
+            self.tag_generation[tag] += 1
+            generation = self.tag_generation[tag]
+
+        entry = RobEntry(seq=seq, instr=instr, tag=tag, old_tag=old_tag,
+                         gen=generation, old_gen=old_gen)
         self.rob.append(entry)
         self.by_seq[seq] = entry
-        if instr.dest is not None:
+
+        if tag is not None:
+            sources = [
+                {"operand": i, "arch": s, "tag": t, "generation": g,
+                 "instance": self._producer_id(t, g)}
+                for i, (s, (t, g)) in enumerate(zip(instr.srcs, src_vers))
+            ]
+            instance = DynamicInstance(
+                id=dynamic_instance_id(seq),
+                seq=seq,
+                op=instr.op,
+                name=instr.name,
+                arch=instr.dest,
+                tag=tag,
+                old_tag=old_tag,
+                generation=generation,
+                dispatch_event_index=self.processed,
+                sources=sources,
+            )
+            self.instances[(tag, generation)] = instance
+            self.instance_by_seq[seq] = instance
+            self.instance_by_id[instance.id] = instance
             self.map_table[instr.dest] = tag
+            self.map_table_vers[instr.dest] = (tag, generation)
         self.next_dispatch += 1
         self.counters["dispatch"] += 1
         return {
@@ -393,6 +680,7 @@ class Simulator:
             "seq": seq,
             "tag": tag,
             "old_tag": old_tag,
+            "generation": generation,
             "src_tags": src_tags,
             "checkpoint": deepcopy(checkpoint) if checkpoint else None,
         }
@@ -474,6 +762,19 @@ class Simulator:
                  "was_done": e.done}
             )
             self.squashed.add(e.seq)
+            self._mark_squashed(e.seq, {
+                "reason": "mispredict",
+                "branch_seq": seq,
+                "predicted_taken": entry.instr.predicted_taken,
+                "actual_taken": ev.taken,
+                "event_index": self.processed,
+                "description": (
+                    f"I{e.seq} 被误预测分支 I{seq}（预测 "
+                    f"{'taken' if entry.instr.predicted_taken else 'not-taken'}，实际 "
+                    f"{'taken' if ev.taken else 'not-taken'}）回滚清除；其物理标签回收后"
+                    "可能被重新分派复用，复用指令不是该步数据来源"
+                ),
+            })
             self.rob.remove(e)
             self.by_seq.pop(e.seq, None)
             self.checkpoints.pop(e.seq, None)
@@ -483,9 +784,10 @@ class Simulator:
             for r in range(ARCH_REGS)
             if self.map_table[r] != cp["map_table"][r]
         ]
-        reclaimed = sorted(e["tag"] for e in squashed_records)
+        reclaimed = sorted(e["tag"] for e in squashed_records if e["tag"] is not None)
         before_map, before_free = list(self.map_table), sorted(self.free_list)
         self.map_table = list(cp["map_table"])
+        self.map_table_vers = list(cp["map_table_vers"])
         self.free_list = sorted(cp["free_list"])
         self.checkpoints.pop(seq, None)
 
@@ -541,6 +843,11 @@ class Simulator:
         self.by_seq.pop(head.seq, None)
         self.committed.append(head.seq)
         self.counters["commit"] += 1
+        if head.tag is not None:
+            inst = self.instances.get((head.tag, head.gen))
+            if inst is not None:
+                inst.committed = True
+                inst.commit_event_index = self.processed
         reclaimed_old = None
         if head.old_tag is not None:
             self.free_list.append(head.old_tag)
@@ -610,6 +917,7 @@ class Simulator:
                      "seq": e.seq}
                 )
                 self.map_table[e.instr.dest] = e.old_tag
+                self.map_table_vers[e.instr.dest] = (e.old_tag, e.old_gen)
             if e.instr.dest is not None:
                 self.free_list.append(e.tag)
             reclaimed.append(e.tag)
@@ -618,6 +926,17 @@ class Simulator:
                  "dest": e.instr.dest, "was_done": e.done,
                  "is_faulting": e.seq == fault.seq}
             )
+            self._mark_squashed(e.seq, {
+                "reason": "exception",
+                "fault_seq": fault.seq,
+                "event_index": self.processed,
+                "is_faulting": e.seq == fault.seq,
+                "description": (
+                    f"I{e.seq} 是精确异常故障指令 I{fault.seq} 自身或其更年轻结果，"
+                    "在故障到达 ROB 队首时被丢弃；其物理标签回收后可能被重新分派复用，"
+                    "复用指令不是恢复映射的数据来源"
+                ),
+            })
 
         for e in reversed(everyone[1:]):
             rollback_entry(e)
@@ -671,6 +990,9 @@ class Simulator:
             self.violation = violation
             self.finished = True
         after = self.snapshot()
+        # Record the post-event versioned map (unchanged on a violation) so
+        # lineage queries are anchored to the mapping at every executed step.
+        self.map_history.append(list(self.map_table_vers))
         self.processed += 1
         step = {
             "index": self.processed - 1,
