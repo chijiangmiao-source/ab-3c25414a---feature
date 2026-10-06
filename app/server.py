@@ -24,10 +24,12 @@ import os
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from .simulator import (
+    ARCH_REGS,
     DEFAULT_NUM_PHYS,
+    LineageQueryError,
     Violation,
     parse_events,
     parse_program,
@@ -103,6 +105,26 @@ class Session:
             self.steps = []
             return {"reset": True}
 
+    def lineage(self, step: int, reg: int) -> dict:
+        """Real lineage query: the dependency DAG of `reg` as mapped at the
+        executed `step`. Rejects steps past the cursor / past the first
+        violation and invalid registers (LineageQueryError)."""
+        with self.lock:
+            dag = self.sim.lineage_at(step, reg)
+            event = self.events[step]
+            dag = dict(dag)
+            dag["session_id"] = self.id
+            dag["cursor"] = len(self.steps)
+            dag["num_events"] = len(self.events)
+            dag["violation_step"] = (
+                next((i for i, s in enumerate(self.steps) if s["violation"]), None)
+            )
+            dag["event"] = {
+                "kind": event.kind, "seq": event.seq, "taken": event.taken,
+                "text": event.text, "description": event.describe(),
+            }
+            return dag
+
 
 def _public_step(step: dict) -> dict:
     # Steps are already plain dicts; kept as a seam in case the schema evolves.
@@ -176,6 +198,46 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return data
 
+    # -- lineage ------------------------------------------------------------
+
+    def _handle_lineage(self, sid: str, query: dict):
+        with _sessions_lock:
+            session = _sessions.get(sid)
+        if session is None:
+            self._send_json({"error": f"unknown session {sid}"}, 404)
+            return
+
+        raw_step = (query.get("step") or [""])[0]
+        raw_reg = (query.get("reg") or [""])[0].strip().upper()
+        try:
+            step = int(raw_step)
+        except (TypeError, ValueError):
+            self._send_json({
+                "error": "query parameter 'step' must be an integer event index",
+                "code": "LINEAGE_BAD_STEP",
+            }, 400)
+            return
+        reg_token = raw_reg[1:] if raw_reg.startswith("R") else raw_reg
+        try:
+            reg = int(reg_token)
+        except (TypeError, ValueError):
+            reg = -1
+        if not 0 <= reg < ARCH_REGS:
+            self._send_json({
+                "error": f"query parameter 'reg' must be R0..R{ARCH_REGS - 1}",
+                "code": "LINEAGE_BAD_REGISTER",
+            }, 400)
+            return
+
+        try:
+            dag = session.lineage(step, reg)
+        except LineageQueryError as exc:
+            status = 409 if exc.code in (
+                "LINEAGE_STEP_AHEAD", "LINEAGE_AFTER_VIOLATION") else 400
+            self._send_json({"error": exc.message, "code": exc.code}, status)
+            return
+        self._send_json({"ok": True, "lineage": dag})
+
     # -- routing -----------------------------------------------------------
 
     def do_GET(self):
@@ -194,13 +256,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_static(rel, CONTENT_TYPES.get(ext, "application/octet-stream"))
             elif path.startswith("/api/sessions/"):
                 rest = path[len("/api/sessions/"):]
-                sid = rest.strip("/")
-                with _sessions_lock:
-                    session = _sessions.get(sid)
-                if session is None:
-                    self._send_json({"error": f"unknown session {sid}"}, 404)
+                parts = [p for p in rest.split("/") if p]
+                query = parse_qs(parsed.query)
+                if len(parts) == 2 and parts[1] == "lineage":
+                    self._handle_lineage(parts[0], query)
+                elif len(parts) == 1:
+                    sid = parts[0]
+                    with _sessions_lock:
+                        session = _sessions.get(sid)
+                    if session is None:
+                        self._send_json({"error": f"unknown session {sid}"}, 404)
+                    else:
+                        self._send_json(session.to_state())
                 else:
-                    self._send_json(session.to_state())
+                    self._send_json({"error": "not found", "path": path}, 404)
             else:
                 self._send_json({"error": "not found", "path": path}, 404)
         except Exception as exc:  # pragma: no cover - defensive

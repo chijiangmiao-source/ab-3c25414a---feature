@@ -140,6 +140,89 @@ class HttpApiTests(unittest.TestCase):
         with ServerHarness() as h:
             h.request("/api/sessions/nope/step", "POST", expect_status=404)
 
+    def test_lineage_unknown_session_404(self):
+        with ServerHarness() as h:
+            h.request("/api/sessions/nope/lineage?step=0&reg=R1",
+                      "GET", expect_status=404)
+
+    def test_lineage_dag_and_tag_generations(self):
+        with ServerHarness() as h:
+            status, s = h.request("/api/sessions", "POST",
+                                  {"program": PROG, "events": EVENTS_OK}, 201)
+            sid = s["id"]
+            for _ in range(10):
+                h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+            # after dispatch I3 (step 3): R3 -> I3@P10g1
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=3&reg=R3",
+                "GET", expect_status=200)
+            dag = body["lineage"]
+            self.assertTrue(body["ok"])
+            self.assertEqual(dag["root"], "I3@P10g1")
+            self.assertEqual(dag["physical_tag"], 10)
+            self.assertEqual(dag["generation"], 1)
+            self.assertEqual(dag["as_of_step"], 3)
+            self.assertEqual(dag["nodes"][0]["id"], dag["root"])
+            # after the mispredict (step 9): R3 back to initial P3
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=9&reg=R3",
+                "GET", expect_status=200)
+            dag = body["lineage"]
+            self.assertEqual(dag["root"], "initial:R3")
+            cleared = {c["seq"]: c for c in dag["cleared_instances"]}
+            self.assertIn(3, cleared)
+            self.assertEqual(cleared[3]["squash"]["cause"], "branch_mispredict")
+            # initial-only DAG has no edges
+            self.assertEqual(dag["edges"], [])
+
+    def test_lineage_refuses_step_ahead_of_cursor(self):
+        with ServerHarness() as h:
+            status, s = h.request("/api/sessions", "POST",
+                                  {"program": PROG, "events": EVENTS_OK}, 201)
+            sid = s["id"]
+            h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=5&reg=R1",
+                "GET", expect_status=409)
+            self.assertEqual(body["code"], "LINEAGE_STEP_AHEAD")
+
+    def test_lineage_refuses_invalid_register_and_step(self):
+        with ServerHarness() as h:
+            status, s = h.request("/api/sessions", "POST",
+                                  {"program": PROG, "events": EVENTS_OK}, 201)
+            sid = s["id"]
+            h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=0&reg=R9",
+                "GET", expect_status=400)
+            self.assertEqual(body["code"], "LINEAGE_BAD_REGISTER")
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=x&reg=R1",
+                "GET", expect_status=400)
+            self.assertEqual(body["code"], "LINEAGE_BAD_STEP")
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?reg=R1",
+                "GET", expect_status=400)
+            self.assertEqual(body["code"], "LINEAGE_BAD_STEP")
+
+    def test_lineage_after_violation_refused_violation_step_allowed(self):
+        with ServerHarness() as h:
+            status, s = h.request("/api/sessions", "POST",
+                                  {"program": PROG, "events": EVENTS_BAD}, 201)
+            sid = s["id"]
+            for _ in range(11):
+                h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+            # query at the violating step itself is allowed
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=10&reg=R3",
+                "GET", expect_status=200)
+            self.assertTrue(body["ok"])
+            # no step past the violation may be queried, even within range
+            status, body = h.request(
+                f"/api/sessions/{sid}/lineage?step=12&reg=R3",
+                "GET", expect_status=409)
+            self.assertEqual(body["code"], "LINEAGE_AFTER_VIOLATION")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

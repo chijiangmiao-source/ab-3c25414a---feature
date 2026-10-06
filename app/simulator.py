@@ -24,7 +24,6 @@ evidence (map table, ROB, free list, checkpoints, reclaimed tags).
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -48,6 +47,18 @@ class Violation(Exception):
 
     def to_dict(self) -> dict:
         return {"code": self.code, "message": self.message, "evidence": self.evidence}
+
+
+class LineageQueryError(Exception):
+    """A lineage query references a step / register that cannot be queried."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def to_dict(self) -> dict:
+        return {"code": self.code, "message": self.message}
 
 
 @dataclass
@@ -267,6 +278,256 @@ def _seq_arg(args, pos, line_idx, required=True):
 
 
 # ---------------------------------------------------------------------------
+# Value lineage (producer / dependency DAG with physical-tag generations)
+# ---------------------------------------------------------------------------
+
+class Lineage:
+    """Tracks the true data provenance of every architectural register value.
+
+    Each value-producing dispatch is a node identified by the dynamic
+    dispatch instance *and* the allocation generation of its physical tag,
+    so a later instruction that reuses the same physical register (after the
+    tag was reclaimed) can never be mistaken for the producer of an earlier
+    result.  Edges are captured at dispatch time from the rename mapping
+    visible then; they are immutable afterwards.
+
+    The producer table (arch reg -> node id) follows map-table restorations
+    on branch mispredictions and precise-exception rollbacks, and per-event
+    copies are kept so a query can reconstruct the DAG exactly as it was at
+    any executed step.
+    """
+
+    INITIAL = "initial"
+    DISPATCH = "dispatch"
+    SQUASH_BRANCH = "branch_mispredict"
+    SQUASH_EXCEPTION = "precise_exception"
+
+    def __init__(self, num_phys: int):
+        self.num_phys = num_phys
+        # Allocation generation per physical tag; initial mappings own gen 0,
+        # every allocation from the free list opens a new generation.
+        self.generation = [0] * num_phys
+        self.nodes: dict[str, dict] = {}
+        self.seq_node: dict[int, str] = {}
+        self.producer: dict[int, str] = {}
+        # producer_history[i] is the producer table after event i was applied
+        # (identical to the pre-event table when event i was a violation).
+        self.producer_history: list[dict[int, str]] = []
+        for r in range(ARCH_REGS):
+            nid = self.initial_id(r)
+            self.nodes[nid] = {
+                "id": nid,
+                "kind": self.INITIAL,
+                "seq": None,
+                "label": f"初始 R{r} → P{r}",
+                "op": None,
+                "dest": r,
+                "srcs": [],
+                "is_branch": False,
+                "dispatch_event": None,
+                "tag": r,
+                "tag_name": f"P{r}",
+                "generation": 0,
+                "prev_producer": None,
+                "sources": [],
+                "squash": None,  # set when/if the instance is ever cleared
+            }
+            self.producer[r] = nid
+
+    @staticmethod
+    def initial_id(arch: int) -> str:
+        return f"initial:R{arch}"
+
+    @staticmethod
+    def node_id(seq: int, tag: int, generation: int) -> str:
+        return f"I{seq}@P{tag}g{generation}"
+
+    def note_dispatch(self, instr: "Instruction", tag: Optional[int],
+                      src_tags: list, map_table: list, event_index: int) -> None:
+        """Record a dispatch. Branches produce no value and get no node."""
+        if instr.dest is None or tag is None:
+            return
+        self.generation[tag] += 1
+        gen = self.generation[tag]
+        nid = self.node_id(instr.seq, tag, gen)
+        sources = []
+        for pos, arch in enumerate(instr.srcs):
+            src_tag = map_table[arch]
+            producer_id = self.producer[arch]
+            producer = self.nodes[producer_id]
+            # The captured tag/generation must agree with the live mapping.
+            assert producer["tag"] == src_tag, (producer, src_tag)
+            sources.append({
+                "position": pos,
+                "arch": arch,
+                "arch_name": f"R{arch}",
+                "tag": src_tag,
+                "tag_name": f"P{src_tag}",
+                "generation": producer["generation"],
+                "producer": producer_id,
+                "captured_at_event": event_index,
+            })
+        self.nodes[nid] = {
+            "id": nid,
+            "kind": self.DISPATCH,
+            "seq": instr.seq,
+            "label": f"I{instr.seq} {instr.name}",
+            "op": instr.op,
+            "dest": instr.dest,
+            "srcs": list(instr.srcs),
+            "is_branch": instr.is_branch,
+            "dispatch_event": event_index,
+            "tag": tag,
+            "tag_name": f"P{tag}",
+            "generation": gen,
+            "prev_producer": self.producer[instr.dest],
+            "sources": sources,
+            "squash": None,
+        }
+        self.seq_node[instr.seq] = nid
+        self.producer[instr.dest] = nid
+
+    def note_squash(self, seq: int, squash: dict) -> None:
+        nid = self.seq_node.get(seq)
+        if nid is not None:
+            self.nodes[nid]["squash"] = squash
+
+    def restore_producers(self, snapshot: dict[int, str]) -> None:
+        # Misprediction recovery: map and producers return to the checkpoint.
+        self.producer = dict(snapshot)
+
+    def restore_producer_for(self, seq: int, dest: int, tag: int) -> None:
+        """Precise-exception young→old walk companion: when the map table
+        drops `tag` for `dest`, reinstate the producer captured before that
+        dispatch (the node that produced its old tag)."""
+        nid = self.seq_node.get(seq)
+        if nid is None:
+            return
+        node = self.nodes[nid]
+        if dest is not None and self.producer.get(dest) == nid:
+            self.producer[dest] = node["prev_producer"]
+
+    def record_event(self) -> None:
+        self.producer_history.append(dict(self.producer))
+
+    # -- DAG construction ---------------------------------------------------
+
+    def dag(self, reg: int, as_of: int) -> dict:
+        """Return the dependency DAG feeding `reg` as it was mapped after
+        event `as_of` (inclusive). Nodes are immutable instances; statuses
+        and clearance notes are evaluated against the full replayed prefix,
+        so instances cleared *after* `as_of` still carry their later squash
+        explanation while the topology itself stays frozen at `as_of`."""
+        root = self.producer_history[as_of][reg]
+
+        reachable: list[str] = []
+        seen = set()
+        stack = [root]
+        while stack:
+            nid = stack.pop()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            reachable.append(nid)
+            for s in self.nodes[nid]["sources"]:
+                stack.append(s["producer"])
+
+        edges = []
+        for nid in reachable:
+            node = self.nodes[nid]
+            for s in node["sources"]:
+                edges.append({
+                    "from": nid,
+                    "to": s["producer"],
+                    "source_position": s["position"],
+                    "source_arch": s["arch"],
+                    "source_arch_name": s["arch_name"],
+                    "tag": s["tag"],
+                    "tag_name": s["tag_name"],
+                    "generation": s["generation"],
+                    "captured_at_event": s["captured_at_event"],
+                })
+
+        def node_sort_key(nid: str) -> tuple:
+            n = self.nodes[nid]
+            if n["kind"] == self.INITIAL:
+                return (1, 0, n["tag"], 0)
+            return (0, n["dispatch_event"], n["seq"], 0)
+
+        ordered_ids = sorted(seen, key=node_sort_key)
+        # Root always leads the listing regardless of event ordering.
+        ordered_ids.remove(root)
+        ordered_ids.insert(0, root)
+
+        nodes_out = []
+        for nid in ordered_ids:
+            n = self.nodes[nid]
+            squash = n["squash"]
+            cleared_as_of = squash is not None and squash["event"] <= as_of
+            if n["kind"] == self.INITIAL:
+                status = "initial"
+            elif cleared_as_of:
+                status = "squashed"
+            else:
+                status = "live"
+            nodes_out.append({
+                "id": n["id"],
+                "kind": n["kind"],
+                "status": status,
+                "seq": n["seq"],
+                "label": n["label"],
+                "op": n["op"],
+                "dest": n["dest"],
+                "srcs": list(n["srcs"]),
+                "is_branch": n["is_branch"],
+                "dispatch_event": n["dispatch_event"],
+                "tag": n["tag"],
+                "tag_name": n["tag_name"],
+                "generation": n["generation"],
+                "squash": squash,
+                "later_cleared": squash is not None and squash["event"] > as_of,
+            })
+
+        edges.sort(key=lambda e: (
+            self.nodes[e["from"]]["dispatch_event"]
+            if self.nodes[e["from"]]["kind"] == self.DISPATCH else 1 << 30,
+            self.nodes[e["from"]]["seq"] if self.nodes[e["from"]]["seq"] is not None else -1,
+            e["source_position"],
+        ))
+
+        # Clearance explanations for instances that used to produce this
+        # architectural register and were invalidated within the replay.
+        cleared = []
+        for n in self.nodes.values():
+            if (n["kind"] == self.DISPATCH and n["dest"] == reg
+                    and n["squash"] is not None):
+                cleared.append({
+                    "id": n["id"],
+                    "seq": n["seq"],
+                    "label": n["label"],
+                    "tag_name": n["tag_name"],
+                    "generation": n["generation"],
+                    "squash": n["squash"],
+                    "cleared_as_of_step": n["squash"]["event"] <= as_of,
+                })
+        cleared.sort(key=lambda c: (c["squash"]["event"], c["seq"]))
+
+        root_node = self.nodes[root]
+        return {
+            "reg": reg,
+            "reg_name": f"R{reg}",
+            "as_of_step": as_of,
+            "root": root,
+            "physical_tag": root_node["tag"],
+            "tag_name": root_node["tag_name"],
+            "generation": root_node["generation"],
+            "nodes": nodes_out,
+            "edges": edges,
+            "cleared_instances": cleared,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Simulator
 # ---------------------------------------------------------------------------
 
@@ -284,6 +545,7 @@ class Simulator:
         self.next_dispatch = 0
         self.committed = []
         self.squashed = set()
+        self.lineage = Lineage(num_phys)
         self.counters = {
             "dispatch": 0,
             "writeback": 0,
@@ -294,6 +556,7 @@ class Simulator:
         }
         self.finished = False
         self.violation: Optional[dict] = None
+        self.violation_step: Optional[int] = None
         self.processed = 0
         self.rollback_log = []   # precise-exception rollbacks performed
 
@@ -370,6 +633,11 @@ class Simulator:
         # Source operands read through the current rename mapping.
         src_tags = [self.map_table[s] for s in instr.srcs]
 
+        # Capture immutable value lineage (producer instances + edges) before
+        # the destination mapping moves; opens a new allocation generation
+        # for the tag so later tag reuse can never alias this instance.
+        self.lineage.note_dispatch(instr, tag, src_tags, self.map_table, self.processed)
+
         checkpoint = None
         if instr.is_branch:
             # Checkpoint rename state immediately after this branch occupies
@@ -378,6 +646,7 @@ class Simulator:
             checkpoint = {
                 "map_table": list(self.map_table),
                 "free_list": sorted(self.free_list),
+                "producers": dict(self.lineage.producer),
             }
             self.checkpoints[seq] = checkpoint
 
@@ -394,7 +663,11 @@ class Simulator:
             "tag": tag,
             "old_tag": old_tag,
             "src_tags": src_tags,
-            "checkpoint": deepcopy(checkpoint) if checkpoint else None,
+            "checkpoint": (
+                {"map_table": list(checkpoint["map_table"]),
+                 "free_list": sorted(checkpoint["free_list"])}
+                if checkpoint else None
+            ),
         }
 
     def _do_writeback(self, ev: Event) -> dict:
@@ -477,6 +750,20 @@ class Simulator:
             self.rob.remove(e)
             self.by_seq.pop(e.seq, None)
             self.checkpoints.pop(e.seq, None)
+            self.lineage.note_squash(
+                e.seq,
+                {"cause": self.lineage.SQUASH_BRANCH,
+                 "cause_label": "分支误预测恢复",
+                 "event": self.processed,
+                 "branch_seq": seq,
+                 "branch_taken": ev.taken,
+                 "predicted_taken": entry.instr.predicted_taken,
+                 "reclaimed_tag": e.tag,
+                 "restored_tag": e.old_tag,
+                 "dest": e.instr.dest,
+                 "message": f"I{e.seq} 在分支 I{seq} 误预测恢复时被清除：标签 P{e.tag}"
+                            f" 被回收，映射恢复至检查点",
+                 })
 
         restored = [
             {"arch": r, "from": self.map_table[r], "to": cp["map_table"][r]}
@@ -487,7 +774,13 @@ class Simulator:
         before_map, before_free = list(self.map_table), sorted(self.free_list)
         self.map_table = list(cp["map_table"])
         self.free_list = sorted(cp["free_list"])
+        # Value lineage follows the restored map: producers valid at the
+        # checkpoint take over again; the squashed instances stay recorded
+        # only as cleared history.
+        self.lineage.restore_producers(cp["producers"])
         self.checkpoints.pop(seq, None)
+        public_cp = {"map_table": list(cp["map_table"]),
+                     "free_list": sorted(cp["free_list"])}
 
         return {
             "action": "resolve",
@@ -498,7 +791,7 @@ class Simulator:
             "squashed": squashed_records,
             "reclaimed_tags": reclaimed,
             "restored_mappings": restored,
-            "checkpoint": {"map_table": list(cp["map_table"]), "free_list": sorted(cp["free_list"])},
+            "checkpoint": public_cp,
             "before_rollback": {"map_table": before_map, "free_list": before_free},
         }
 
@@ -610,6 +903,9 @@ class Simulator:
                      "seq": e.seq}
                 )
                 self.map_table[e.instr.dest] = e.old_tag
+                # Reinstate the producer instance that backed the old tag,
+                # keeping lineage and the precise map in lock-step.
+                self.lineage.restore_producer_for(e.seq, e.instr.dest, e.tag)
             if e.instr.dest is not None:
                 self.free_list.append(e.tag)
             reclaimed.append(e.tag)
@@ -618,6 +914,21 @@ class Simulator:
                  "dest": e.instr.dest, "was_done": e.done,
                  "is_faulting": e.seq == fault.seq}
             )
+            self.lineage.note_squash(
+                e.seq,
+                {"cause": self.lineage.SQUASH_EXCEPTION,
+                 "cause_label": "精确异常恢复",
+                 "event": self.processed,
+                 "fault_seq": fault.seq,
+                 "reclaimed_tag": e.tag,
+                 "restored_tag": e.old_tag,
+                 "dest": e.instr.dest,
+                 "is_faulting": e.seq == fault.seq,
+                 "message": (f"故障指令 I{fault.seq} 到达 ROB 队首："
+                             + ("故障指令自身目标" if e.seq == fault.seq
+                                else f"I{e.seq} 等更年轻结果")
+                             + " 不提交，按 young→old 逆序恢复精确映射"),
+                 })
 
         for e in reversed(everyone[1:]):
             rollback_entry(e)
@@ -669,8 +980,12 @@ class Simulator:
         except Violation as exc:
             violation = exc.to_dict()
             self.violation = violation
+            self.violation_step = self.processed
             self.finished = True
         after = self.snapshot()
+        # A violating event changes no machine state; recording the (same)
+        # producer table keeps producer_history[i] aligned with step i.
+        self.lineage.record_event()
         self.processed += 1
         step = {
             "index": self.processed - 1,
@@ -684,6 +999,34 @@ class Simulator:
         if violation:
             step["violation"] = violation
         return step
+
+    # -- lineage queries ----------------------------------------------------
+
+    def lineage_at(self, step: int, reg: int) -> dict:
+        """Dependency DAG for architectural register `reg` using the mapping
+        that was current after executed event `step` (0-based). Raises
+        LineageQueryError for steps past the cursor / past the first
+        violation or for an invalid register."""
+        if not isinstance(step, int) or isinstance(step, bool):
+            raise LineageQueryError("LINEAGE_BAD_STEP", "step must be an integer event index")
+        if self.violation_step is not None and step > self.violation_step:
+            raise LineageQueryError(
+                "LINEAGE_AFTER_VIOLATION",
+                f"step {step} lies after the first violation "
+                f"(event #{self.violation_step}); replay terminated there",
+            )
+        if step < 0 or step >= self.processed:
+            raise LineageQueryError(
+                "LINEAGE_STEP_AHEAD",
+                f"step {step} has not been executed yet "
+                f"({self.processed} event(s) currently replayed)",
+            )
+        if not isinstance(reg, int) or isinstance(reg, bool) or not 0 <= reg < ARCH_REGS:
+            raise LineageQueryError(
+                "LINEAGE_BAD_REGISTER",
+                f"invalid register {reg!r}; expected R0..R{ARCH_REGS - 1}",
+            )
+        return self.lineage.dag(reg, step)
 
     def run(self, events: list) -> dict:
         steps = []

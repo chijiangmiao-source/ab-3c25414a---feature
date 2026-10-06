@@ -138,6 +138,9 @@ const els = {
   banner: document.getElementById("violation-banner"),
   timeline: document.getElementById("timeline"),
   detail: document.getElementById("detail"),
+  lineageReg: document.getElementById("lineage-reg"),
+  lineageStatus: document.getElementById("lineage-status"),
+  lineagePanel: document.getElementById("lineage-panel"),
   btnValidate: document.getElementById("btn-validate"),
   btnSimulate: document.getElementById("btn-simulate"),
   btnSession: document.getElementById("btn-session"),
@@ -150,7 +153,12 @@ let state = {
   violationStep: null,
   selected: -1,
   sessionId: null,
-  instructions: []
+  lineageSessionId: null,
+  lineageSessionPromise: null,
+  instructions: [],
+  selectedReg: 0,
+  lineageReq: 0,
+  reportPayload: null
 };
 
 function initExamples() {
@@ -213,6 +221,17 @@ function clearResult() {
   els.timeline.innerHTML = "";
   els.detail.innerHTML = '<p class="placeholder">执行后在此展开证据。</p>';
   els.banner.classList.add("hidden");
+  resetLineagePanel();
+}
+
+function resetLineagePanel() {
+  els.lineageReg.disabled = true;
+  els.lineageStatus.textContent = "";
+  els.lineageStatus.className = "status-line";
+  els.lineagePanel.innerHTML =
+    '<p class="placeholder">在时间线选择一个已执行步骤并选择体系结构寄存器后，' +
+    '从当前物理结果一路展开到产生者指令及其源操作数；物理标签附带分配代次，' +
+    '复用同一标签的后来指令不会被误作来源。</p>';
 }
 
 function renderReport(report) {
@@ -266,7 +285,215 @@ function selectStep(i) {
     li.classList.toggle("selected", idx === i));
   els.detail.innerHTML = "";
   els.detail.appendChild(renderStepDetail(step));
+  refreshLineage(i);
 }
+
+// ----------------------------------------------------------------- lineage
+
+const ARCH_REG_COUNT = 8;
+
+function populateRegOptions() {
+  if (els.lineageReg.options.length) return;
+  for (let r = 0; r < ARCH_REG_COUNT; r++) {
+    const o = document.createElement("option");
+    o.value = String(r);
+    o.textContent = `R${r}`;
+    els.lineageReg.appendChild(o);
+  }
+  els.lineageReg.value = String(state.selectedReg);
+}
+
+function setLineagePlaceholder(html) {
+  els.lineagePanel.innerHTML = `<p class="placeholder">${html}</p>`;
+}
+
+async function refreshLineage(stepIdx) {
+  populateRegOptions();
+  els.lineageReg.disabled = false;
+  let sid;
+  try {
+    sid = await ensureLineageSession(stepIdx);
+  } catch (e) {
+    els.lineageStatus.textContent = e.message;
+    els.lineageStatus.className = "status-line err";
+    setLineagePlaceholder(escapeHtml(e.message));
+    return;
+  }
+  await loadLineage(sid, stepIdx, Number(els.lineageReg.value));
+}
+
+async function ensureLineageSession(stepIdx) {
+  // Interactive sessions are queried directly. For one-shot reports a
+  // backing session is created lazily and fast-forwarded to the chosen
+  // step, so the lineage shown is always the real session query.
+  if (state.sessionId) return state.sessionId;
+  if (!state.lineageSessionId) {
+    if (!state.lineageSessionPromise) {
+      state.lineageSessionPromise = api("/api/sessions", "POST",
+                                        state.reportPayload || payload());
+    }
+    const s = await state.lineageSessionPromise;
+    state.lineageSessionId = s.id;
+  }
+  const sid = state.lineageSessionId;
+  let s = await api(`/api/sessions/${sid}`, "GET");
+  while (s.cursor <= stepIdx && !s.done) {
+    const r = await api(`/api/sessions/${sid}/step`, "POST");
+    s = r.state;
+  }
+  return sid;
+}
+
+async function loadLineage(sid, stepIdx, reg) {
+  const reqId = ++state.lineageReq;
+  els.lineageStatus.textContent = "查询谱系…";
+  els.lineageStatus.className = "status-line";
+  setLineagePlaceholder("查询中…");
+  let body;
+  try {
+    body = await api(
+      `/api/sessions/${sid}/lineage?step=${stepIdx}&reg=R${reg}`,
+      "GET");
+  } catch (e) {
+    if (reqId !== state.lineageReq) return;
+    els.lineageStatus.textContent = e.message;
+    els.lineageStatus.className = "status-line err";
+    setLineagePlaceholder(escapeHtml(e.message));
+    return;
+  }
+  if (reqId !== state.lineageReq) return;  // a newer selection superseded this
+  els.lineageStatus.textContent = "";
+  renderLineage(body.lineage);
+}
+
+function renderLineage(dag) {
+  const nodes = {};
+  for (const n of dag.nodes) nodes[n.id] = n;
+  const childrenOf = {};
+  for (const e of dag.edges) {
+    (childrenOf[e.from] = childrenOf[e.from] || []).push(e);
+  }
+  for (const k of Object.keys(childrenOf)) {
+    childrenOf[k].sort((a, b) => a.source_position - b.source_position);
+  }
+
+  els.lineagePanel.innerHTML = "";
+
+  const info = document.createElement("p");
+  info.className = "lin-root-info";
+  const rootNode = nodes[dag.root];
+  info.innerHTML =
+    `事件 #${dag.as_of_step}（${escapeHtml(dag.event.description)}）后，` +
+    `<strong>${dag.reg_name}</strong> 的当前物理结果为 ` +
+    `<span class="tag">${dag.tag_name}</span>` +
+    `（分配代次 <span class="lin-gen${dag.generation === 0 ? " g0" : ""}">g${dag.generation}</span>），` +
+    `产生者：${rootNode.kind === "initial"
+      ? `<span class="diff-to">${escapeHtml(rootNode.label)}</span>`
+      : `<strong>${escapeHtml(rootNode.label)}</strong>（分派事件 #${rootNode.dispatch_event}）`}`;
+  els.lineagePanel.appendChild(info);
+
+  const tree = document.createElement("ul");
+  tree.className = "lin-tree";
+  tree.appendChild(renderLineageNode(dag.root, nodes, childrenOf, null, new Set()));
+  els.lineagePanel.appendChild(tree);
+
+  if (dag.cleared_instances.length) {
+    const log = document.createElement("div");
+    log.className = "lin-cleared-log";
+    log.innerHTML = "<h4>相关清除说明（实例已失效，标签可能被重新分配）</h4>";
+    for (const c of dag.cleared_instances) {
+      const div = document.createElement("div");
+      div.className = "lin-note";
+      const timing = c.cleared_as_of_step
+        ? "在该步骤之前/当时已被清除"
+        : `查询时仍有效，但在其后的事件 #${c.squash.event} 被清除`;
+      div.textContent =
+        `■ ${c.label}（${c.tag_name} g${c.generation}）：${c.squash.cause_label} — ${c.squash.message}（${timing}）`;
+      log.appendChild(div);
+    }
+    els.lineagePanel.appendChild(log);
+  }
+}
+
+function renderLineageNode(id, nodes, childrenOf, incomingEdge, active) {
+  const n = nodes[id];
+  const li = document.createElement("li");
+  li.className = "lin-node";
+  if (active.has(id)) {
+    // A shared ancestor already rendered on the current path: name it once.
+    li.innerHTML = `<span class="lin-card"><span class="lname">${escapeHtml(n.label)}</span> ` +
+      `<span class="lin-event">（同一实例，见上方展开）</span></span>`;
+    return li;
+  }
+
+  const kids = childrenOf[id] || [];
+  const wrap = document.createElement(kids.length ? "details" : "div");
+  if (kids.length) {
+    wrap.className = "lin-disclosure";
+    wrap.open = true;
+  }
+  const row = document.createElement(kids.length ? "summary" : "div");
+  row.className = "lin-row" + (kids.length ? "" : " leaf");
+
+  if (incomingEdge) {
+    const edge = document.createElement("span");
+    edge.className = "lin-edge";
+    edge.innerHTML =
+      `源 ${incomingEdge.source_arch_name} = ` +
+      `<span class="tag">${incomingEdge.tag_name}</span>` +
+      `<span class="lin-gen${incomingEdge.generation === 0 ? " g0" : ""}">g${incomingEdge.generation}</span> ` +
+      `<span class="e-arrow">──</span> `;
+    row.appendChild(edge);
+  }
+
+  const twisty = document.createElement("span");
+  twisty.className = "lin-twisty";
+  twisty.textContent = kids.length ? "▼" : "•";
+  row.appendChild(twisty);
+
+  const card = document.createElement("span");
+  card.className = `lin-card ${n.kind} ${n.status}`;
+  const statusText = n.status === "initial" ? "初始值"
+    : n.status === "squashed" ? "已清除" : "有效";
+  card.innerHTML =
+    `<span class="lname">${escapeHtml(n.label)}</span>` +
+    `<span class="lin-gen${n.generation === 0 ? " g0" : ""}">${n.tag_name} · g${n.generation}</span>` +
+    (n.kind === "dispatch"
+      ? `<span class="lin-event">分派@事件#${n.dispatch_event}</span>` : "") +
+    `<span class="lin-status ${n.status}">${statusText}</span>` +
+    (n.later_cleared
+      ? `<span class="lin-event">（其后被${escapeHtml(n.squash.cause_label)}清除）</span>` : "");
+  row.appendChild(card);
+  wrap.appendChild(row);
+
+  if (n.squash && n.status === "squashed") {
+    const note = document.createElement("div");
+    note.className = "lin-note";
+    note.textContent = `${n.squash.cause_label}：${n.squash.message}`;
+    wrap.appendChild(note);
+  }
+
+  if (kids.length) {
+    const ul = document.createElement("ul");
+    ul.className = "lin-children";
+    const nextActive = new Set(active);
+    nextActive.add(id);
+    for (const e of kids) {
+      ul.appendChild(renderLineageNode(e.to, nodes, childrenOf, e, nextActive));
+    }
+    wrap.appendChild(ul);
+  }
+
+  li.appendChild(wrap);
+  return li;
+}
+
+els.lineageReg.addEventListener("change", () => {
+  state.selectedReg = Number(els.lineageReg.value);
+  if (state.selected >= 0 && state.steps[state.selected]) {
+    refreshLineage(state.selected);
+  }
+});
 
 function mapTable(snap, changedCols) {
   const tbl = document.createElement("table");
@@ -517,6 +744,13 @@ async function loadSessionState(s) {
   state.violationStep = s.violation ? s.cursor - 1 : null;
   renderTimeline(s.num_events);
   els.cursorInfo.textContent = `逐步会话 ${s.id}：${s.cursor}/${s.num_events} 事件`;
+  if (!s.steps.length) {
+    setVerdict("逐步复核进行中", "");
+    els.banner.classList.add("hidden");
+    resetLineagePanel();
+    setLineagePlaceholder("会话已复位：单步执行事件后，可在此按步骤与寄存器查询数据谱系。");
+    return;
+  }
   if (s.violation) {
     setVerdict("发现违规（已定位首个）", "bad");
     renderViolationBanner(s.violation);
@@ -539,6 +773,9 @@ async function createSession() {
     const s = await api("/api/sessions", "POST", payload());
     clearResult();
     state.sessionId = s.id;
+    state.lineageSessionId = null;
+    state.lineageSessionPromise = null;
+    state.reportPayload = null;
     setSessionButtons(true);
     setStatus(`会话 ${s.id} 已建立`, "ok");
     await loadSessionState(s);
@@ -589,6 +826,9 @@ els.btnSimulate.addEventListener("click", async () => {
     const r = await api("/api/simulate", "POST", payload());
     setStatus("");
     state.sessionId = null;
+    state.lineageSessionId = null;
+    state.lineageSessionPromise = null;
+    state.reportPayload = payload();
     setSessionButtons(false);
     renderReport(r);
   } catch (e) {

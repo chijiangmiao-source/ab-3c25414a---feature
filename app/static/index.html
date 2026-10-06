@@ -58,6 +58,18 @@
         <div id="detail" class="detail">
           <p class="placeholder">执行后在此展开首个违规事件（或任一步）前后的映射表、ROB 与回收寄存器证据。</p>
         </div>
+        <div id="lineage-section" class="lineage-section">
+          <div class="lineage-bar">
+            <h3>数据谱系（按所选步骤当时映射的真实查询）</h3>
+            <label for="lineage-reg" class="small">体系结构寄存器
+              <select id="lineage-reg" disabled></select>
+            </label>
+            <span id="lineage-status" class="status-line"></span>
+          </div>
+          <div id="lineage-panel" class="lineage-panel">
+            <p class="placeholder">在时间线选择一个已执行步骤并选择体系结构寄存器后，从当前物理结果一路展开到产生者指令及其源操作数；物理标签附带分配代次，复用同一标签的后来指令不会被误作来源。</p>
+          </div>
+        </div>
       </div>
     </div>
   </section>

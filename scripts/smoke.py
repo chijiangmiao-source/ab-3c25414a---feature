@@ -133,6 +133,33 @@ def main():
         step_body = json.loads(raw.decode())
         check("POST /api/sessions/<id>/step advances cursor",
               status == 200 and step_body["state"]["cursor"] == 1, str(step_body)[:200])
+
+        # value-lineage query: replay all 11 events (the mispredict resolve
+        # is event #10), then verify generation-tagged producers and the
+        # post-recovery instance
+        for _ in range(10):
+            request("POST", f"/api/sessions/{sid}/step")
+        status, raw = request("GET", f"/api/sessions/{sid}/lineage?step=3&reg=R3")
+        lin = json.loads(raw.decode())
+        dag = lin.get("lineage", {})
+        check("lineage names dispatch-time producer with generation",
+              status == 200 and dag.get("root") == "I3@P10g1"
+              and dag.get("generation") == 1, str(dag)[:200])
+        status, raw = request("GET", f"/api/sessions/{sid}/lineage?step=10&reg=R3")
+        lin = json.loads(raw.decode())
+        dag = lin.get("lineage", {})
+        check("lineage after mispredict points to restored initial instance",
+              status == 200 and dag.get("root") == "initial:R3"
+              and any(c.get("seq") == 3 for c in dag.get("cleared_instances", [])),
+              str(dag)[:200])
+        status, _ = request("GET", f"/api/sessions/{sid}/lineage?step=40&reg=R3")
+        check("lineage past cursor refused with 409", status == 409)
+        status, body = request("GET", f"/api/sessions/{sid}/lineage?step=0&reg=R9")
+        check("lineage invalid register refused with 400",
+              status == 400 and json.loads(body.decode()).get("code") == "LINEAGE_BAD_REGISTER")
+        status, _ = request("GET", "/api/sessions/deadbeef/lineage?step=0&reg=R3")
+        check("lineage unknown session refused with 404", status == 404)
+
         status, raw = request("POST", f"/api/sessions/{sid}/reset")
         reset_body = json.loads(raw.decode())
         check("POST /api/sessions/<id>/reset rewinds cursor",
